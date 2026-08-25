@@ -1,4 +1,3 @@
-
 """Background control worker.
 
 The GUI thread must never block on serial / CAN IO, so all bus interaction
@@ -17,6 +16,8 @@ from __future__ import annotations
 import math
 import queue
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -57,6 +58,7 @@ class Connect(Command):
     #: DIFFERENT name adds a second bus alongside the first instead of
     #: replacing it, which is how a multi-adapter setup is built up.
     bus_name: str = "bus0"
+
 
 @dataclass
 class AddMotor(Command):
@@ -253,6 +255,14 @@ VERBOSE_LOG_DIVISOR: int = 50
 #: transport already retries transient CH340 hiccups internally), short enough
 #: that a yanked adapter does not leave enabled motors unsupervised for long.
 COMM_FAILURE_LIMIT: int = 10
+
+#: Longest the coordinator waits for one bus to finish its slice of a tick.
+#: Generous next to the ~10 ms tick because a bus with several motors makes
+#: several blocking round-trips, each able to wait BusConfig.response_timeout
+#: (0.15 s) for a reply. Exceeding it means that adapter is wedged: the tick is
+#: abandoned for that bus and the others carry on, rather than the whole robot
+#: blocking on one bad cable. The stranded motors stop themselves via canTimeout.
+BUS_TICK_TIMEOUT_S: float = 0.5
 
 #: Any command whose handler blocks the single-threaded control loop longer than
 #: this (milliseconds) is logged with its measured duration. The worker services
@@ -472,10 +482,14 @@ class ControlWorker(QObject):
         # line so each row shows voltage/current alongside position and torque.
         self._last_power: dict[int, tuple[float, float]] = {}
         self._safety = SafetyState(SafetyLimits.for_model(proto.DEFAULT_MODEL))
-        # Set once the user pushes explicit limits via SetLimits. While it is
-        # False the envelope is model-derived and _refresh_model_limits() may
-        # recompute it; once True, a manual choice is never overwritten.
+        # True once the user has explicitly pushed limits via SetLimits, after
+        # which the model-derived envelope is never recomputed behind their back.
         self._limits_user_set = False
+        # One pool thread per CAN bus, so buses transmit CONCURRENTLY instead of
+        # one waiting on the other. Created on connect once a second bus exists;
+        # a single-bus setup runs inline and never touches a thread.
+        self._pool: Optional[ThreadPoolExecutor] = None
+        self._pool_size = 0
         self._rate_hz = rate_hz
         self._loop_count = 0
         self._comm_failures = 0
@@ -506,8 +520,6 @@ class ControlWorker(QObject):
             self._loop_count += 1
             self._drain_commands()
             if self._bus is not None and self._bus.is_open:
-                # Hand the loop's own timestamp down so every motor serviced
-                # this tick is evaluated at the SAME instant.
                 self._service_motors(t0)
             dt = time.monotonic() - t0
             if dt < period:
@@ -577,8 +589,6 @@ class ControlWorker(QObject):
             self._estop(cmd.engage)
         elif isinstance(cmd, SetLimits):
             self._safety.limits = cmd.limits
-            # Latch the manual override so a later AddMotor cannot silently
-            # revert the user's caps to the model defaults.
             self._limits_user_set = True
         elif isinstance(cmd, SetCalibration):
             self._calib[cmd.device_id] = Calibration(int(cmd.direction), float(cmd.offset))
@@ -600,26 +610,21 @@ class ControlWorker(QObject):
     def _refresh_model_limits(self) -> None:
         """Rebuild the safety envelope from the models actually on the bus.
 
-        The envelope was previously derived once from ``DEFAULT_MODEL``
-        ("rs-04") in ``__init__`` and never revisited, so it stayed an rs-04
-        envelope regardless of what was connected. On an rs-03 that is wrong in
-        both directions: the velocity cap (0.6 x rs-04's 15 rad/s = 9 rad/s)
-        throttles a motor rated far higher, while the torque cap (0.5 x rs-04's
-        120 Nm = 60 Nm) equals the rs-03's entire rated torque -- i.e. no
-        headroom protection at all.
+        The envelope used to be derived once from ``DEFAULT_MODEL`` ("rs-04") in
+        ``__init__`` and never revisited, so it stayed an rs-04 envelope no
+        matter what was connected. On an rs-03 that is wrong in both directions:
+        the velocity cap (0.6 x rs-04's 15 rad/s = 9) throttles a motor rated far
+        higher, while the torque cap (0.5 x rs-04's 120 Nm = 60 Nm) equals the
+        rs-03's *entire* rated torque, i.e. no headroom protection at all.
 
-        There is still a single global envelope, so on a mixed bus take the
-        strictest cap across the registered models: the only choice that stays
-        safe for every motor present. Position bounds narrow via max()/min() on
-        the min/max pair; every other cap is an absolute ceiling, so min().
-
-        A user SetLimits always wins and is never overwritten here.
+        With a mixed bus there is still one global envelope, so take the
+        strictest cap across the registered models - the only choice that is
+        safe for every motor present. A user SetLimits always wins and is never
+        overwritten here.
         """
         if self._bus is None or self._limits_user_set:
             return
         models = {m.model for m in self._bus.motors.values()} or {proto.DEFAULT_MODEL}
-        # sorted() keeps the fold deterministic so the result does not depend on
-        # set iteration order.
         envelopes = [SafetyLimits.for_model(model) for model in sorted(models)]
         strictest = envelopes[0]
         for env in envelopes[1:]:
@@ -634,6 +639,24 @@ class ControlWorker(QObject):
             )
         self._safety.limits = strictest
 
+    def _ensure_pool(self) -> None:
+        """Size the bus thread pool to the number of registered buses.
+
+        Skipped entirely for a single bus: with nothing to run in parallel the
+        pool would only add hand-off cost, and the inline path keeps
+        single-adapter behaviour exactly as it was. The pool only grows - a
+        smaller reconnect leaves spare idle threads, which is cheaper and safer
+        than tearing down a pool that may still hold a running tick.
+        """
+        n = len(self._bus.buses) if self._bus is not None else 0
+        if n <= 1 or (self._pool is not None and self._pool_size >= n):
+            return
+        old = self._pool
+        self._pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="bus")
+        self._pool_size = n
+        if old is not None:
+            old.shutdown(wait=False)
+
     def _connect(self, cmd: Connect) -> None:
         self._comm_failures = 0
         # Additive: a second Connect under a new bus_name joins the existing
@@ -645,9 +668,8 @@ class ControlWorker(QObject):
         for m in cmd.motors:
             self._bus.add_motor(m, cmd.bus_name)
             self._targets.setdefault(m.device_id, MotorTarget())
-        # Motors are known now, so size the envelope to them before any frame
-        # goes out -- otherwise the first commands ride on rs-04 defaults.
         self._refresh_model_limits()
+        self._ensure_pool()
         self._bus.open()
         self.connectionChanged.emit(True)
         self.log.emit(f"Connected via {cmd.transport.name}")
@@ -658,7 +680,6 @@ class ControlWorker(QObject):
             return
         self._bus.add_motor(Motor(device_id=device_id, model=model), bus_name)
         self._targets.setdefault(device_id, MotorTarget())
-        # A motor added after Connect can introduce a new model, so re-derive.
         self._refresh_model_limits()
 
     def _teardown(self) -> None:
@@ -675,6 +696,12 @@ class ControlWorker(QObject):
             except Exception:
                 pass
             self._bus = None
+            if self._pool is not None:
+                # wait=False: never block the control loop on a wedged bus
+                # thread. Its transport is closed above, so it unwinds shortly.
+                self._pool.shutdown(wait=False)
+                self._pool = None
+                self._pool_size = 0
             self._comm_failures = 0
             self._motor_faults.clear()
             self._hold_recovery_attempts.clear()
@@ -882,7 +909,7 @@ class ControlWorker(QObject):
         ``sweepStopped`` so the UI's sweep button clears too. No-op if idle."""
         if not target.sweep_enabled:
             return
-        target.position = self._sweep_position(target)
+        target.position = self._sweep_position(target, time.monotonic())
         target.sweep_enabled = False
         self.sweepStopped.emit(device_id)
 
@@ -966,19 +993,14 @@ class ControlWorker(QObject):
         else:
             # Freeze the setpoint where the sweep left off so the motor holds
             # instead of jumping back to a stale manual position.
-            t.position = self._sweep_position(t)
+            t.position = self._sweep_position(t, time.monotonic())
             self.log.emit(f"M{cmd.device_id}: sweep stopped")
 
     @staticmethod
     def _sweep_position(t: MotorTarget, now: Optional[float] = None) -> float:
-        """Sine setpoint evaluated at ``now``.
-
-        ``now`` comes from the caller rather than being read here, so every
-        motor in one control tick is evaluated at one instant. Reading the
-        clock per motor made each motor's phase depend on where it fell in the
-        servicing order - a few ms of skew between motors that are supposed to
-        move together.
-        """
+        """Sine setpoint for the current time: ``from`` at t0, ``to`` at the
+        half-period, back to ``from`` at the full period. Continuous in velocity
+        (no snap at the endpoints), which is what makes it smooth."""
         if now is None:
             now = time.monotonic()
         mid = (t.sweep_from + t.sweep_to) / 2.0
@@ -1379,8 +1401,22 @@ class ControlWorker(QObject):
     # -- per-loop servicing ------------------------------------------------------
 
     def _service_motors(self, t_tick: Optional[float] = None) -> None:
-        # Optional so existing callers and tests still work; the real loop
-        # always passes its own t0.
+        """One control tick: command every enabled motor, then publish results.
+
+        Split into two phases so multiple CAN buses run at the same time:
+
+        1. IO phase - each bus's motors are serviced on their OWN thread, all
+           buses in parallel. Pure blocking IO, which releases the GIL, so this
+           is real concurrency. Nothing here emits Qt signals.
+        2. Publish phase - back on this thread, in one pass, results are turned
+           into signals and follow-up actions (fault logs, range cutout, hold
+           recovery). Keeping every emit on one thread means the UI sees exactly
+           the same single-threaded signal stream it always did.
+
+        Within a bus, motors are still commanded one after another - CAN is one
+        wire and carries one frame at a time. What changes is that can1 no longer
+        waits for can0 to finish.
+        """
         if t_tick is None:
             t_tick = time.monotonic()
         read_power = self._loop_count % POWER_READ_DIVISOR == 0
@@ -1389,15 +1425,103 @@ class ControlWorker(QObject):
         # count that a dead one keeps accruing in the same cycle, and the
         # watchdog could never trip (nor its error dedup engage).
         failures_before = self._comm_failures
-        for device_id, target in list(self._targets.items()):
-            if self._bus is None:
-                return  # the watchdog tore the connection down mid-iteration
-            if not target.enabled or self._safety.estop:
+        records = self._run_bus_batches(self._batch_by_bus(), t_tick, read_power)
+        self._publish_records(records)
+        if self._bus is not None and self._comm_failures == failures_before:
+            self._comm_failures = 0  # clean pass: the link is healthy again
+
+    def _batch_by_bus(self) -> "dict[str, list[tuple[int, MotorTarget]]]":
+        """Group the enabled motors by the bus that owns them."""
+        if self._bus is None or self._safety.estop:
+            return {}
+        enabled = [(d, t) for d, t in list(self._targets.items()) if t.enabled]
+        buses = getattr(self._bus, "buses", None)
+        if not buses:
+            # A plain RobstrideBus rather than a BusRouter (a direct caller or a
+            # test double). Treat it as one unnamed bus: every motor in a single
+            # batch, serviced inline, exactly as before routing existed.
+            return {"": enabled} if enabled else {}
+        # Reverse map bus object -> name. Rebuilt each tick rather than cached:
+        # it is a handful of entries, and a cache would go stale on reconnect.
+        name_of = {id(bus): name for name, bus in buses.items()}
+        batches: "dict[str, list[tuple[int, MotorTarget]]]" = {}
+        for device_id, target in enabled:
+            try:
+                bus = self._bus.bus_for(device_id)
+            except KeyError:
+                continue  # not registered on any bus - nothing to command
+            name = name_of.get(id(bus))
+            if name is not None:
+                batches.setdefault(name, []).append((device_id, target))
+        return batches
+
+    def _run_bus_batches(self, batches: dict, t_tick: float,
+                         read_power: bool) -> list:
+        """Run every bus's batch, in parallel when there is more than one."""
+        if not batches:
+            return []
+        if len(batches) == 1 or self._pool is None:
+            # Single bus: run inline. No thread hand-off, and the behaviour is
+            # byte-for-byte what it was before threads existed.
+            batch = next(iter(batches.values()))
+            return self._service_bus(batch, t_tick, read_power)
+        # Submit EVERY bus before waiting on any of them - that is what makes
+        # them overlap. Submitting and collecting one at a time would still be
+        # sequential, which is the whole thing this exists to avoid.
+        futures = [self._pool.submit(self._service_bus, batch, t_tick, read_power)
+                   for batch in batches.values()]
+        records: list = []
+        for fut in futures:
+            try:
+                records.extend(fut.result(timeout=BUS_TICK_TIMEOUT_S))
+            except FutureTimeout:
+                self.log.emit(
+                    f"[timing] a CAN bus did not finish its tick within "
+                    f"{BUS_TICK_TIMEOUT_S * 1000:.0f} ms - skipped this cycle")
+            except Exception as e:
+                self._note_comm_failure(f"{type(e).__name__}: {e}")
+        return records
+
+    def _service_bus(self, batch: list, t_tick: float,
+                     read_power: bool) -> list:
+        """Command one bus's motors. RUNS ON A POOL THREAD.
+
+        Must not emit Qt signals or touch worker state shared across buses -
+        results are returned for the caller to publish on the control thread.
+        The per-device dict writes it does make (``_last_raw_pos`` inside
+        ``_decalibrate``, the sweep setpoint on the motor's own target) are to
+        keys owned exclusively by this bus, since CAN ids are unique across
+        buses, so they cannot race another bus's thread.
+        """
+        records = []
+        for device_id, target in batch:
+            if self._bus is None or self._safety.estop or not target.enabled:
                 continue
             try:
                 status = self._command_motor(device_id, target, t_tick)
             except TransportError as e:
-                self._note_comm_failure(str(e))
+                records.append((device_id, target, None, None, str(e)))
+                continue
+            power = None
+            if read_power:
+                try:
+                    power = self._read_power_values(device_id)
+                except TransportError as e:
+                    records.append((device_id, target, status, None, str(e)))
+                    continue
+            records.append((device_id, target, status, power, None))
+        return records
+
+    def _publish_records(self, records: list) -> None:
+        """Turn one tick's results into signals and follow-up actions.
+
+        Runs on the control thread, after every bus has finished, so signal
+        order and the actions that can disable a motor (range cutout, hold
+        recovery) stay single-threaded exactly as before.
+        """
+        for device_id, target, status, power, error in records:
+            if error is not None:
+                self._note_comm_failure(error)
                 continue
             if status is not None:
                 self.statusUpdated.emit(device_id, status)
@@ -1410,10 +1534,12 @@ class ControlWorker(QObject):
                 # cutout just tripped is not immediately re-energised.
                 if target.enabled:
                     self._recover_dropped_hold(device_id, target, status)
-            if read_power:
-                self._read_power(device_id)
-        if self._bus is not None and self._comm_failures == failures_before:
-            self._comm_failures = 0  # clean pass: the link is healthy again
+            if power is not None:
+                vbus, iq = power
+                self._last_power[device_id] = (vbus, iq)
+                self.powerUpdated.emit(
+                    device_id, PowerInfo(device_id, vbus, iq, vbus * iq))
+                self._log_power_change(device_id, vbus, iq)
 
     #: Human-readable labels for the fault bits in a status frame, in priority
     #: order. ``undervoltage``/``overcurrent`` come first: those are the ones
@@ -1454,26 +1580,38 @@ class ControlWorker(QObject):
             f"M{device_id}: FAULT {labels} "
             f"[torque={status.torque:+.2f} Nm, temp={status.temperature:.0f}C]")
 
-    def _read_power(self, device_id: int) -> None:
-        """Read the board's bus voltage and current and emit derived power.
+    def _read_power_values(self, device_id: int) -> "Optional[tuple[float, float]]":
+        """Read (VBUS, Iq) for one motor. RUNS ON A POOL THREAD.
 
-        These are plain READ_PARAMETER round-trips (never a motion frame), so
-        they are safe to interleave with the control loop without disturbing the
-        motor. Done at ~5 Hz via :data:`POWER_READ_DIVISOR` to keep them off the
-        hot path. A non-responding read leaves the value out and emits nothing.
+        The IO half of the old ``_read_power``: plain READ_PARAMETER
+        round-trips (never a motion frame), so they are safe to interleave with
+        the control loop without disturbing the motor. Split out so the reads
+        happen inside the parallel phase while the emitting stays on the
+        control thread. Returns None if either register does not answer;
+        TransportError propagates to the caller, which records it.
         """
         if self._bus is None:
-            return
+            return None
+        vbus = self._bus.read_param(device_id, ParameterType.VBUS)
+        iq = self._bus.read_param(device_id, ParameterType.IQ_FILTERED)
+        if vbus is None or iq is None:
+            return None
+        return (float(vbus), float(iq))
+
+    def _read_power(self, device_id: int) -> None:
+        """Read power for one motor and emit it immediately (control thread).
+
+        Retained for callers outside the tick; the tick itself uses
+        ``_read_power_values`` plus ``_publish_records``.
+        """
         try:
-            vbus = self._bus.read_param(device_id, ParameterType.VBUS)
-            iq = self._bus.read_param(device_id, ParameterType.IQ_FILTERED)
+            values = self._read_power_values(device_id)
         except TransportError as e:
             self._note_comm_failure(str(e))
             return
-        if vbus is None or iq is None:
+        if values is None:
             return
-        vbus = float(vbus)
-        iq = float(iq)
+        vbus, iq = values
         self._last_power[device_id] = (vbus, iq)
         self.powerUpdated.emit(device_id, PowerInfo(device_id, vbus, iq, vbus * iq))
         self._log_power_change(device_id, vbus, iq)
