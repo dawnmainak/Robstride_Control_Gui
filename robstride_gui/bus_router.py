@@ -23,6 +23,7 @@ later. With a single bus registered, behaviour is identical to before.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from .bus import Motor, RobstrideBus
@@ -83,10 +84,18 @@ class BusRouter:
         silently rerouting the motor.
         """
         if bus_name is None:
+            # Scan/inventory already recorded which bus answered for this id, so
+            # a later registration with no explicit bus must reuse that owner
+            # rather than demanding the caller repeat it.
+            known = self._owner.get(motor.device_id)
+            if known is not None:
+                known.add_motor(motor)
+                return
             if len(self.buses) != 1:
                 raise ValueError(
-                    f"bus_name is required when {len(self.buses)} buses are "
-                    f"registered")
+                    f"bus_name is required for motor {motor.device_id} when "
+                    f"{len(self.buses)} buses are registered and the motor has "
+                    f"not been discovered by a scan")
             bus_name = next(iter(self.buses))
         bus = self.buses[bus_name]
         previous = self._owner.get(motor.device_id)
@@ -143,6 +152,27 @@ class BusRouter:
 
     # -- fan-out operations ------------------------------------------------------
 
+    def _fan_out(self, call):
+        """Run ``call(bus)`` on every bus AT ONCE, returning [(bus, result)].
+
+        Discovery pings every id in the range and waits ~20 ms on each empty
+        one, so a 0-127 sweep costs ~2.5 s per bus. Run one bus after another
+        that cost multiplies by the number of adapters - and because discovery
+        blocks the control loop, a long enough sweep exceeds the motors'
+        canTimeout window and drops every enabled motor to standby. Fanning out
+        makes the cost that of the slowest bus instead of their sum.
+
+        A short-lived pool is fine here: discovery is an occasional operator
+        action, not the hot path, and this keeps the router free of the control
+        loop's pool lifecycle.
+        """
+        buses = list(self.buses.values())
+        if len(buses) <= 1:
+            return [(bus, call(bus)) for bus in buses]
+        with ThreadPoolExecutor(max_workers=len(buses),
+                                thread_name_prefix="scan") as pool:
+            return list(zip(buses, pool.map(call, buses)))
+
     def scan(self, start: int = 1, end: int = 16) -> list[int]:
         """Scan every bus and return the union of responding ids, sorted.
 
@@ -150,8 +180,8 @@ class BusRouter:
         routable immediately without a separate registration step.
         """
         found: list[int] = []
-        for bus in self.buses.values():
-            for device_id in bus.scan(start, end):
+        for bus, ids in self._fan_out(lambda b: b.scan(start, end)):
+            for device_id in ids:
                 self._owner.setdefault(device_id, bus)
                 if device_id not in found:
                     found.append(device_id)
@@ -159,11 +189,11 @@ class BusRouter:
 
     def inventory(self, start: int = 1, end: int = 16) -> list[tuple[int, list[bytes]]]:
         items: list[tuple[int, list[bytes]]] = []
-        for bus in self.buses.values():
-            for device_id, uids in bus.inventory(start, end):
+        for bus, entries in self._fan_out(lambda b: b.inventory(start, end)):
+            for device_id, uids in entries:
                 self._owner.setdefault(device_id, bus)
                 items.append((device_id, uids))
-        return items
+        return sorted(items)
 
     def find_collisions(self, device_ids: list[int]) -> list[int]:
         """Ids answered by more than one motor.

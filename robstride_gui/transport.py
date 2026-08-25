@@ -174,6 +174,7 @@ class SocketCANTransport(Transport):
         self.channel = channel
         self.bitrate = bitrate
         self._bus = None
+
     #: sysfs IFF_UP bit. A CAN interface can exist and be bindable while
     #: administratively DOWN, so this flag - not mere existence - is what says
     #: the kernel will actually transmit on it.
