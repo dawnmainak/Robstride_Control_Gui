@@ -25,7 +25,8 @@ from ..presets import Preset, PresetStore
 from ..protocol import MotorStatus
 from ..transport import (
     SerialATTransport, SocketCANTransport,
-    auto_detect_serial_port, list_serial_port_details,
+    auto_detect_serial_port, can_interface_is_up, list_can_interfaces,
+    list_serial_port_details,
 )
 from .. import worker as wk
 from .dashboard import MotorDashboard
@@ -192,8 +193,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.port_combo)
 
         self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setToolTip("Re-scan for available serial ports")
-        self.refresh_btn.clicked.connect(self._refresh_serial_ports)
+        self.refresh_btn.setToolTip("Re-scan for available ports / CAN interfaces")
+        self.refresh_btn.clicked.connect(self._refresh_ports)
         lay.addWidget(self.refresh_btn)
 
         self.port_status = QLabel()
@@ -410,9 +411,34 @@ class MainWindow(QMainWindow):
         if self._is_serial():
             self._refresh_serial_ports()
         else:
-            self.port_combo.addItems(["can0", "can1"])
-            self.port_status.setText("")
-            self._set_connect_enabled(True)
+            self._refresh_can_channels()
+
+    def _refresh_can_channels(self) -> None:
+        """Populate the port dropdown with every CAN interface on this machine.
+
+        Enumerated from sysfs instead of a fixed two-entry list, so all of a
+        multi-bus adapter's ports appear - a RobStride CAN hub exposes can0..can4
+        and the old hardcoded ["can0", "can1"] hid three of them. Interfaces that
+        are DOWN are still listed but flagged, since the fix is one ip link
+        command away and hiding them would just look like missing hardware.
+        """
+        self.port_combo.clear()
+        channels = list_can_interfaces()
+        up_count = 0
+        for channel in channels:
+            is_up = can_interface_is_up(channel)
+            up_count += is_up
+            label = channel if is_up else f"{channel} (down)"
+            self.port_combo.addItem(label, channel)
+        self._set_port_status(available=up_count > 0, count=up_count)
+        self._set_connect_enabled(bool(channels))
+
+    def _refresh_ports(self) -> None:
+        """Re-enumerate ports for whichever transport is selected."""
+        if self._is_serial():
+            self._refresh_serial_ports()
+        else:
+            self._refresh_can_channels()
 
     def _refresh_serial_ports(self) -> None:
         if not self._is_serial():

@@ -682,15 +682,47 @@ class ControlWorker(QObject):
         self._targets.setdefault(device_id, MotorTarget())
         self._refresh_model_limits()
 
+    def _disable_everything(self) -> None:
+        """De-energise EVERY known motor before the buses close.
+
+        Disconnect must leave no motor holding torque. This used to skip any
+        motor whose ``target.enabled`` was False, which trusts the GUI's belief
+        about a motor rather than the motor itself - and that belief goes stale:
+        a motor enabled before this session started, or one the firmware
+        re-energised, is still powered while we think it is off. DISABLE is
+        idempotent and harmless on an already-idle motor, so the safe move is to
+        send it to everything registered, on the bus AND in the target table.
+
+        Failures are logged rather than silently swallowed. A routing error
+        (an id on no known bus) or a dead link means a motor may still be
+        energised, and that is exactly the thing an operator must be told about
+        instead of it passing as a clean disconnect.
+        """
+        device_ids = set(self._targets)
+        try:
+            device_ids |= set(self._bus.motors)
+        except Exception:
+            pass
+        stranded = []
+        for device_id in sorted(device_ids):
+            try:
+                self._bus.disable(device_id)
+            except Exception as e:
+                stranded.append(f"M{device_id} ({type(e).__name__}: {e})")
+            target = self._targets.get(device_id)
+            if target is not None:
+                target.enabled = False
+                self._stop_sweep(device_id, target)
+                self.motorEnabledChanged.emit(device_id, False)
+        if stranded:
+            self.error.emit(
+                "Could not confirm disable on: " + ", ".join(stranded) +
+                ". These motors may still be energised - cut their power "
+                "before handling the rig.")
+
     def _teardown(self) -> None:
         if self._bus is not None:
-            for device_id, target in self._targets.items():
-                if target.enabled:
-                    try:
-                        self._bus.disable(device_id)
-                    except Exception:
-                        pass
-                    target.enabled = False
+            self._disable_everything()
             try:
                 self._bus.close()
             except Exception:

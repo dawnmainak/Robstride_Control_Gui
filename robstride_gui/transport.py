@@ -274,6 +274,50 @@ class SocketCANTransport(Transport):
         return Frame(comm_type, extra_data, device_id, bytes(msg.data))
 
 
+#: ARPHRD_CAN - the sysfs ``type`` value that marks a network interface as CAN.
+#: Distinguishes a real CAN port from an ethernet/loopback device whose name
+#: happens to start with "can".
+_ARPHRD_CAN = 280
+
+#: Offered when no CAN interface can be enumerated (non-Linux host, or the hub's
+#: driver not loaded yet). Covers the RobStride CAN hub, which exposes can0..can4.
+FALLBACK_CAN_CHANNELS = ("can0", "can1", "can2", "can3", "can4")
+
+
+def list_can_interfaces() -> list[str]:
+    """CAN interfaces present on this machine, naturally sorted.
+
+    Read from sysfs rather than hardcoded, so every port a multi-bus adapter
+    exposes shows up - a RobStride CAN hub presents can0..can4, and a fixed
+    two-entry list silently hides three of them. Sorted numerically so can10
+    follows can9 rather than can1.
+
+    Returns :data:`FALLBACK_CAN_CHANNELS` when nothing can be enumerated, so the
+    dropdown is never empty on a host without sysfs.
+    """
+    from pathlib import Path
+
+    root = Path("/sys/class/net")
+    if not root.is_dir():
+        return list(FALLBACK_CAN_CHANNELS)
+    found = []
+    for iface in root.iterdir():
+        try:
+            if int((iface / "type").read_text().strip()) != _ARPHRD_CAN:
+                continue
+        except (OSError, ValueError):
+            continue
+        found.append(iface.name)
+    if not found:
+        return list(FALLBACK_CAN_CHANNELS)
+    return sorted(found, key=lambda n: (len(n), n))
+
+
+def can_interface_is_up(channel: str) -> bool:
+    """True when ``channel`` is administratively UP (see SocketCANTransport)."""
+    return SocketCANTransport(channel)._interface_state()[1]
+
+
 def _is_usb_serial(device: str, hwid: str) -> bool:
     """True for a hot-plugged USB serial device, False for built-in ttyS* ports.
 
