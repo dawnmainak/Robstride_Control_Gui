@@ -24,6 +24,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import protocol as proto
 from .bus import BusConfig, Motor, RobstrideBus
+from .bus_router import BusRouter
 from .protocol import MotorMode, MotorStatus, ParameterType, RunMode
 from .safety import Calibration, SafetyLimits, SafetyState
 from .transport import Transport, TransportError
@@ -52,7 +53,10 @@ class Command:
 class Connect(Command):
     transport: Transport
     motors: list[Motor]
-
+    #: Name for this adapter's bus, e.g. "can0". Posting Connect again with a
+    #: DIFFERENT name adds a second bus alongside the first instead of
+    #: replacing it, which is how a multi-adapter setup is built up.
+    bus_name: str = "bus0"
 
 @dataclass
 class AddMotor(Command):
@@ -65,6 +69,8 @@ class AddMotor(Command):
 
     device_id: int
     model: str = proto.DEFAULT_MODEL
+    #: Which bus owns this motor. None is fine while only one bus exists.
+    bus_name: Optional[str] = None
 
 
 @dataclass
@@ -548,7 +554,7 @@ class ControlWorker(QObject):
         if isinstance(cmd, Connect):
             self._connect(cmd)
         elif isinstance(cmd, AddMotor):
-            self._add_motor(cmd.device_id, cmd.model)
+            self._add_motor(cmd.device_id, cmd.model, cmd.bus_name)
         elif isinstance(cmd, Disconnect):
             self._teardown()
         elif isinstance(cmd, Scan):
@@ -630,9 +636,14 @@ class ControlWorker(QObject):
 
     def _connect(self, cmd: Connect) -> None:
         self._comm_failures = 0
-        self._bus = RobstrideBus(cmd.transport, BusConfig())
+        # Additive: a second Connect under a new bus_name joins the existing
+        # router rather than discarding the first adapter. Reconnecting the
+        # SAME name replaces just that bus.
+        if self._bus is None:
+            self._bus = BusRouter()
+        self._bus.add_bus(cmd.bus_name, RobstrideBus(cmd.transport, BusConfig()))
         for m in cmd.motors:
-            self._bus.add_motor(m)
+            self._bus.add_motor(m, cmd.bus_name)
             self._targets.setdefault(m.device_id, MotorTarget())
         # Motors are known now, so size the envelope to them before any frame
         # goes out -- otherwise the first commands ride on rs-04 defaults.
@@ -641,10 +652,11 @@ class ControlWorker(QObject):
         self.connectionChanged.emit(True)
         self.log.emit(f"Connected via {cmd.transport.name}")
 
-    def _add_motor(self, device_id: int, model: str) -> None:
+    def _add_motor(self, device_id: int, model: str,
+                   bus_name: Optional[str] = None) -> None:
         if self._bus is None:
             return
-        self._bus.add_motor(Motor(device_id=device_id, model=model))
+        self._bus.add_motor(Motor(device_id=device_id, model=model), bus_name)
         self._targets.setdefault(device_id, MotorTarget())
         # A motor added after Connect can introduce a new model, so re-derive.
         self._refresh_model_limits()
