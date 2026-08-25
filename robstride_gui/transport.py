@@ -174,12 +174,60 @@ class SocketCANTransport(Transport):
         self.channel = channel
         self.bitrate = bitrate
         self._bus = None
+    #: sysfs IFF_UP bit. A CAN interface can exist and be bindable while
+    #: administratively DOWN, so this flag - not mere existence - is what says
+    #: the kernel will actually transmit on it.
+    _IFF_UP = 0x1
+
+    def _interface_state(self) -> tuple[bool, bool]:
+        """Return ``(exists, is_up)`` for ``self.channel``, read from sysfs.
+
+        python-can binds happily to a down CAN interface and does NOT bring it
+        up (the ``bitrate=`` argument is ignored on Linux - only ``ip link``
+        sets it). So open() appears to succeed and then every send() fails with
+        ENETDOWN, "Failed to transmit: Network is down". Checking the flag here
+        turns that into one actionable error at connect time.
+
+        If the state cannot be determined (no sysfs, e.g. a non-Linux host),
+        report ``(True, True)`` so we never block a connection we cannot verify.
+        """
+        from pathlib import Path
+
+        iface = Path("/sys/class/net") / self.channel
+        if not iface.is_dir():
+            return (False, False)
+        try:
+            flags = int((iface / "flags").read_text().strip(), 16)
+        except (OSError, ValueError):
+            return (True, True)   # unknown - do not stand in the way
+        return (True, bool(flags & self._IFF_UP))
 
     def open(self) -> None:
         try:
             import can
         except ImportError as e:  # pragma: no cover - dependency guard
             raise TransportError("python-can is not installed (pip install python-can)") from e
+        # Fail here, loudly, rather than letting every later send() raise
+        # ENETDOWN one frame at a time (see _interface_state).
+        exists, is_up = self._interface_state()
+        if not exists:
+            raise TransportError(
+                f"SocketCAN interface '{self.channel}' does not exist.\n"
+                f"  Load the driver and create the interface:\n"
+                f"    sudo modprobe can can_raw\n"
+                f"    sudo ip link set {self.channel} up type can "
+                f"bitrate {self.bitrate}\n"
+                f"  If your adapter is the serial USB-CAN dongle, switch the\n"
+                f"  Transport dropdown to 'Serial (AT)' instead.")
+        if not is_up:
+            raise TransportError(
+                f"SocketCAN interface '{self.channel}' exists but is DOWN.\n"
+                f"  Every transmit would fail with 'Network is down'. Bring it up:\n"
+                f"    sudo ip link set {self.channel} up type can "
+                f"bitrate {self.bitrate}\n"
+                f"  Then confirm the bitrate matches the motor "
+                f"(RobStride default 1 Mbit/s):\n"
+                f"    ip -details link show {self.channel}")
         try:
             self._bus = can.interface.Bus(interface="socketcan",
                                           channel=self.channel, bitrate=self.bitrate)
