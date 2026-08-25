@@ -500,7 +500,9 @@ class ControlWorker(QObject):
             self._loop_count += 1
             self._drain_commands()
             if self._bus is not None and self._bus.is_open:
-                self._service_motors()
+                # Hand the loop's own timestamp down so every motor serviced
+                # this tick is evaluated at the SAME instant.
+                self._service_motors(t0)
             dt = time.monotonic() - t0
             if dt < period:
                 time.sleep(period - dt)
@@ -956,13 +958,20 @@ class ControlWorker(QObject):
             self.log.emit(f"M{cmd.device_id}: sweep stopped")
 
     @staticmethod
-    def _sweep_position(t: MotorTarget) -> float:
-        """Sine setpoint for the current time: ``from`` at t0, ``to`` at the
-        half-period, back to ``from`` at the full period. Continuous in velocity
-        (no snap at the endpoints), which is what makes it smooth."""
+    def _sweep_position(t: MotorTarget, now: Optional[float] = None) -> float:
+        """Sine setpoint evaluated at ``now``.
+
+        ``now`` comes from the caller rather than being read here, so every
+        motor in one control tick is evaluated at one instant. Reading the
+        clock per motor made each motor's phase depend on where it fell in the
+        servicing order - a few ms of skew between motors that are supposed to
+        move together.
+        """
+        if now is None:
+            now = time.monotonic()
         mid = (t.sweep_from + t.sweep_to) / 2.0
         amp = (t.sweep_to - t.sweep_from) / 2.0
-        phase = (time.monotonic() - t.sweep_t0) / t.sweep_period
+        phase = (now - t.sweep_t0) / t.sweep_period
         return mid - amp * math.cos(2.0 * math.pi * phase)
 
     def _estop(self, engage: bool) -> None:
@@ -1357,7 +1366,11 @@ class ControlWorker(QObject):
 
     # -- per-loop servicing ------------------------------------------------------
 
-    def _service_motors(self) -> None:
+    def _service_motors(self, t_tick: Optional[float] = None) -> None:
+        # Optional so existing callers and tests still work; the real loop
+        # always passes its own t0.
+        if t_tick is None:
+            t_tick = time.monotonic()
         read_power = self._loop_count % POWER_READ_DIVISOR == 0
         # The failure counter may only reset after a *fully clean* pass. If it
         # were reset on any motor's success, one healthy motor would clear the
@@ -1370,7 +1383,7 @@ class ControlWorker(QObject):
             if not target.enabled or self._safety.estop:
                 continue
             try:
-                status = self._command_motor(device_id, target)
+                status = self._command_motor(device_id, target, t_tick)
             except TransportError as e:
                 self._note_comm_failure(str(e))
                 continue
@@ -1520,17 +1533,20 @@ class ControlWorker(QObject):
                 f"M{device_id}: position {math.degrees(user_pos):+.1f} deg left "
                 "the calibrated range - motor disabled for safety")
 
-    def _command_motor(self, device_id: int, t: MotorTarget) -> Optional[MotorStatus]:
+    def _command_motor(self, device_id: int, t: MotorTarget,
+                       now: Optional[float] = None) -> Optional[MotorStatus]:
         """Clamp the target in the *user* frame, convert to the *raw* motor frame
         via the motor's calibration, send it, and de-calibrate the reply back to
         the user frame for display."""
+        if now is None:
+            now = time.monotonic()
         s = self._safety
         c = self._calib.get(device_id) or Calibration()
         # A running sweep drives the position setpoint itself, but only in a
         # position mode - in velocity/current/MIT the position field is unused,
         # so leave it alone. Writing t.position keeps the readout/graph honest.
         if t.sweep_enabled and t.mode in (RunMode.POSITION_PP, RunMode.POSITION_CSP):
-            t.position = self._sweep_position(t)
+            t.position = self._sweep_position(t, now)
         if t.mode == RunMode.MIT:
             raw = self._bus.operation(
                 device_id,
