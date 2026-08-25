@@ -673,8 +673,17 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _on_scan_finished(self, ids: list) -> None:
+        # Register scanned motors as the model selected in the Model combo, not
+        # DEFAULT_MODEL. Hardcoding the default silently filed every discovered
+        # motor as an rs-04, so an rs-03 was encoded with rs-04 MIT full-scale
+        # values (velocity, torque, kp/kd) and its feedback was decoded with the
+        # same wrong scale. The motor answers the ping and gets a tab, so it
+        # looks connected -- it just does not behave.
+        # _on_inventory_ready (the Detect button) already reads the combo; this
+        # brings Scan in line with it.
+        model = self.model_combo.currentText()
         for device_id in ids:
-            self._add_motor(int(device_id), proto.DEFAULT_MODEL)
+            self._add_motor(int(device_id), model)
 
     @Slot(list)
     def _on_bus_collision(self, ids: list) -> None:

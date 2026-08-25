@@ -466,6 +466,10 @@ class ControlWorker(QObject):
         # line so each row shows voltage/current alongside position and torque.
         self._last_power: dict[int, tuple[float, float]] = {}
         self._safety = SafetyState(SafetyLimits.for_model(proto.DEFAULT_MODEL))
+        # Set once the user pushes explicit limits via SetLimits. While it is
+        # False the envelope is model-derived and _refresh_model_limits() may
+        # recompute it; once True, a manual choice is never overwritten.
+        self._limits_user_set = False
         self._rate_hz = rate_hz
         self._loop_count = 0
         self._comm_failures = 0
@@ -565,6 +569,9 @@ class ControlWorker(QObject):
             self._estop(cmd.engage)
         elif isinstance(cmd, SetLimits):
             self._safety.limits = cmd.limits
+            # Latch the manual override so a later AddMotor cannot silently
+            # revert the user's caps to the model defaults.
+            self._limits_user_set = True
         elif isinstance(cmd, SetCalibration):
             self._calib[cmd.device_id] = Calibration(int(cmd.direction), float(cmd.offset))
             self.log.emit(f"M{cmd.device_id}: direction={'inverted' if cmd.direction < 0 else 'normal'}, "
@@ -582,12 +589,52 @@ class ControlWorker(QObject):
         elif isinstance(cmd, StopRangeCalibration):
             self._stop_range_calibration(cmd.device_id)
 
+    def _refresh_model_limits(self) -> None:
+        """Rebuild the safety envelope from the models actually on the bus.
+
+        The envelope was previously derived once from ``DEFAULT_MODEL``
+        ("rs-04") in ``__init__`` and never revisited, so it stayed an rs-04
+        envelope regardless of what was connected. On an rs-03 that is wrong in
+        both directions: the velocity cap (0.6 x rs-04's 15 rad/s = 9 rad/s)
+        throttles a motor rated far higher, while the torque cap (0.5 x rs-04's
+        120 Nm = 60 Nm) equals the rs-03's entire rated torque -- i.e. no
+        headroom protection at all.
+
+        There is still a single global envelope, so on a mixed bus take the
+        strictest cap across the registered models: the only choice that stays
+        safe for every motor present. Position bounds narrow via max()/min() on
+        the min/max pair; every other cap is an absolute ceiling, so min().
+
+        A user SetLimits always wins and is never overwritten here.
+        """
+        if self._bus is None or self._limits_user_set:
+            return
+        models = {m.model for m in self._bus.motors.values()} or {proto.DEFAULT_MODEL}
+        # sorted() keeps the fold deterministic so the result does not depend on
+        # set iteration order.
+        envelopes = [SafetyLimits.for_model(model) for model in sorted(models)]
+        strictest = envelopes[0]
+        for env in envelopes[1:]:
+            strictest = strictest.with_(
+                position_min=max(strictest.position_min, env.position_min),
+                position_max=min(strictest.position_max, env.position_max),
+                velocity_max=min(strictest.velocity_max, env.velocity_max),
+                current_max=min(strictest.current_max, env.current_max),
+                torque_max=min(strictest.torque_max, env.torque_max),
+                kp_max=min(strictest.kp_max, env.kp_max),
+                kd_max=min(strictest.kd_max, env.kd_max),
+            )
+        self._safety.limits = strictest
+
     def _connect(self, cmd: Connect) -> None:
         self._comm_failures = 0
         self._bus = RobstrideBus(cmd.transport, BusConfig())
         for m in cmd.motors:
             self._bus.add_motor(m)
             self._targets.setdefault(m.device_id, MotorTarget())
+        # Motors are known now, so size the envelope to them before any frame
+        # goes out -- otherwise the first commands ride on rs-04 defaults.
+        self._refresh_model_limits()
         self._bus.open()
         self.connectionChanged.emit(True)
         self.log.emit(f"Connected via {cmd.transport.name}")
@@ -597,6 +644,8 @@ class ControlWorker(QObject):
             return
         self._bus.add_motor(Motor(device_id=device_id, model=model))
         self._targets.setdefault(device_id, MotorTarget())
+        # A motor added after Connect can introduce a new model, so re-derive.
+        self._refresh_model_limits()
 
     def _teardown(self) -> None:
         if self._bus is not None:
