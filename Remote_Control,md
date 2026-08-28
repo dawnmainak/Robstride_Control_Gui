@@ -1,0 +1,409 @@
+# Remote control: laptop GUI, Raspberry Pi hardware
+
+Run the RobStride GUI on a laptop while the motors are wired to a Raspberry Pi.
+
+```bash
+python main.py --remote usvz@rs04pi.local \
+    --remote-path '~/Desktop/Robstride_Control_Gui/rpi_agent.py'
+```
+
+Nothing about using the GUI changes. Tabs, plots, presets, sweep, calibration,
+Set ID and E-STOP all behave as they do on a directly attached adapter, because
+the GUI cannot tell the difference.
+
+---
+
+## Why the split is where it is
+
+The obvious design — a CAN-over-network bridge, where the Pi forwards raw frames
+and the laptop keeps using its `Transport` interface — is a very small change and
+it **does not work** on this stack.
+
+The control loop is blocking request/reply, per motor, per tick. Six motors at
+100 Hz is 600 round-trips a second, each needing its reply before the next goes
+out: a budget of roughly **1.7 ms per round-trip**. WiFi round-trip time is
+2-30 ms with spikes past 100 ms. The loop would collapse to a few Hz and every
+motor would repeatedly trip its ~3 s `canTimeout`.
+
+So the boundary sits higher up, between "the GUI decides a target" and "the loop
+transmits it":
+
+```
+Laptop                          Raspberry Pi                  Motors
+MainWindow  --- JSON/SSH --->   ControlWorker  --- CAN --->   can0..can4
+  (UI rate)   20-50 Hz            100 Hz loop      1 Mbit/s
+```
+
+Network jitter now delays a setpoint instead of starving the loop. A 200 ms
+hiccup is invisible; under the other design it is a fault.
+
+## Why the GUI needed almost no changes
+
+`MainWindow` touches the worker exactly two ways: it calls `post(Command)`, and
+it connects to fourteen Qt signals. That is already a clean network boundary.
+
+`RemoteWorker` declares the *same fourteen signals* and the *same* `post()`.
+Only three small edits to `main_window.py` were needed:
+
+1. `__init__` accepts a `remote` tuple.
+2. `_start_worker` builds a `RemoteWorker` instead of a `ControlWorker`, and
+   skips the `QThread` — `RemoteWorker.run()` owns a pipe, not a control loop,
+   so it returns immediately and must not be driven by `QThread.started`.
+3. The link starts **after** `_build_ui()`. `RemoteWorker.run()` can emit
+   `log`/`error` synchronously if ssh fails at once, and those handlers write to
+   widgets — starting it inside `_start_worker` reached a log view that did not
+   exist yet. This was a real crash during bring-up.
+
+---
+
+## Files
+
+| File | Runs on | Purpose |
+|---|---|---|
+| `rpi_agent.py` | **Pi** | Headless agent. JSON commands on stdin, telemetry on stdout. |
+| `robstride_gui/remote_worker.py` | Laptop | ControlWorker-shaped proxy over the pipe. |
+| `main.py` | Laptop | `--remote` and `--remote-path`. |
+| `robstride_gui/ui/main_window.py` | Laptop | The three edits above. |
+| `publish.py` | Laptop | Standalone one-motor panel. Imports nothing from `robstride_gui`. |
+
+### Keep `rpi_agent.py` in git
+
+It runs on the Pi, so it is easy to leave it living only on the SD card — outside
+version control, with no way to tell from the laptop which version is deployed.
+Keep the laptop copy as the source of truth and treat the Pi's as a deployment:
+
+```bash
+rsync -av rpi_agent.py usvz@rs04pi.local:~/Desktop/Robstride_Control_Gui/
+```
+
+There is no version check at runtime. Edit on the laptop, forget to push, and
+you will be running the old agent and wondering why a fix did not take.
+
+---
+
+## Transport: why SSH stdio
+
+The agent is launched as `ssh <host> 'python3 -u rpi_agent.py'` and spoken to
+over the resulting pipe, one JSON object per line.
+
+- No listening port, no firewall rules, no TLS to configure.
+- Authentication and encryption come from SSH, which you already have.
+- Bidirectional from the start: stdin carries commands, stdout carries telemetry.
+
+**`python3 -u` is mandatory.** Without unbuffered output, Python holds telemetry
+in a 4 KB buffer and the laptop sees nothing until the process exits.
+
+Anything the agent prints to stdout that is not protocol JSON corrupts the
+stream, so all its diagnostics go to **stderr**, which SSH forwards to the
+laptop's terminal.
+
+The agent is a plain program reading stdin — SSH is only the pipe. It can be
+driven locally on the Pi for testing, which is a useful way to separate a link
+fault from a motor fault:
+
+```bash
+printf '%s\n' \
+  '{"cmd":"connect","kind":"socketcan","channel":"can4","bus_name":"can4","motors":[{"device_id":3,"model":"rs-03"}]}' \
+  '{"cmd":"ping"}' | python3 -u rpi_agent.py
+```
+
+---
+
+## The full data path
+
+### Three threads on the Pi
+
+`rpi_agent.py` starts two daemon threads, then hands its **main thread** to the
+control loop:
+
+| Thread | Runs | Job |
+|---|---|---|
+| main | `worker.run()` | the 100 Hz control loop |
+| reader | `read_stdin()` | parse commands from the laptop |
+| watchdog | `watchdog()` | E-STOP if the link goes quiet |
+| pool xN | `_service_bus()` | one per CAN bus, created on connect |
+
+### Inbound: laptop to motor
+
+1. **`rpi_agent.py` `read_stdin()`** (reader thread) — `json.loads`, then
+   `handle()` for simple verbs or `handle_generic()` for a serialised dataclass.
+   Ends at `worker.post(cmd)`, a thread-safe queue push. **The reader never
+   touches the bus.**
+2. **`worker.py` `_drain_commands()`** (control thread) — pops up to 50 commands
+   per tick, `_apply()` dispatches on type. `SetTarget` just writes numbers into
+   a `MotorTarget`. **Still nothing on the wire.**
+3. **`worker.py` `_service_motors(t0)`**, every 10 ms — `_batch_by_bus()` groups
+   enabled motors by owning bus, `_run_bus_batches()` submits every bus to the
+   pool *before* waiting on any, so buses transmit concurrently.
+4. **`worker.py` `_command_motor()`** (pool thread) — where the number becomes
+   safe: `clamp_position()` against the safety envelope, `_clamp_to_range()`
+   against calibrated travel, `pos_to_raw()` for zero offset and direction.
+5. **`bus_router.py`** — `__getattr__` catches the call, `bus_for(device_id)`
+   finds the owning bus. This is why the worker's ~38 call sites never learned
+   there are five buses.
+6. **`bus.py` -> `protocol.py`** — builds the frame: 29-bit ID packed as
+   `comm_type<<24 | extra<<8 | device_id`, plus 8 data bytes.
+7. **`transport.py`** — `SocketCANTransport.send()` -> python-can -> kernel ->
+   `can4` -> motor.
+
+### Outbound: motor to laptop
+
+1. The motor **acks every setpoint write with a status frame**. There is no
+   separate poll, deliberately: `poll_status` sends a zero-stiffness MIT frame
+   that would brake the motor every cycle.
+2. **`protocol.py` `parse_status()`** unpacks position, velocity, torque,
+   temperature and the fault bits.
+3. **`worker.py` `_decalibrate()`** converts back to the user frame.
+4. **`worker.py` `_publish_records()`** (control thread, after every bus
+   finishes) emits `statusUpdated`. Every signal comes from one thread in one
+   order, so the UI sees the same stream it always did.
+5. **`rpi_agent.py` `_on_status()`** buffers and flushes a **batch at 20 Hz**.
+   The loop produces 100 Hz per motor; sending all of it would be hundreds of
+   messages a second for a UI that cannot use them. Batching also puts one
+   timestamp on the group, so samples line up.
+6. `send()` writes one JSON line to stdout -> ssh -> laptop.
+7. `remote_worker.py` `_read_loop()` re-emits it as the matching Qt signal.
+
+### One subtlety
+
+The agent has **no `QCoreApplication`**, so Qt signals connect *directly* -
+`_on_status` executes on whichever thread emitted, the control thread. That is
+why `Agent.send()` holds a lock: the control thread and the watchdog thread can
+both write stdout, and interleaved writes make a torn JSON line.
+
+---
+
+## Protocol
+
+**Laptop to Pi.** Commands serialise **generically** — class name plus dataclass
+fields — so all twenty command types work with no per-command mapping, and any
+command added later keeps working:
+
+```json
+{"cmd": "Command", "name": "SetTarget",
+ "fields": {"device_id": 3, "position": 0.5, "velocity": null}}
+```
+
+Two need special handling:
+
+- **`Connect`** carries a live `Transport` object, which cannot cross a pipe and
+  refers to hardware on the wrong machine anyway — the laptop has no `can4`.
+  Only the intent travels, as `{"kind": "socketcan", "channel": "can4"}`, and
+  the Pi builds the real transport against its own hardware.
+- **`SetLimits`** nests a `SafetyLimits` dataclass, flattened out and rebuilt in.
+
+The agent also accepts a simpler verb protocol (`connect`, `enable`, `target`,
+`mode`, `estop`, `ping`, `shutdown`) so a script or `publish.py` can drive it
+without importing the driver stack.
+
+**Pi to laptop.** One JSON object per line, each mapping to a Qt signal:
+
+| `sig` | Becomes |
+|---|---|
+| `status` | `statusUpdated` (batched, one timestamp per group) |
+| `power` | `powerUpdated` (batched) |
+| `connection` | `connectionChanged` |
+| `enabled` | `motorEnabledChanged` |
+| `scan` / `inventory` / `collision` | the matching signal |
+| `calibration` / `range` / `zero_state` | the matching signal |
+| `motor_id` / `sweep_stopped` | the matching signal |
+| `log` / `error` | `log` / `error` |
+
+---
+
+## Safety
+
+Three independent layers, because the link failing is exactly when nobody is
+watching the rig.
+
+**1. Link watchdog (`COMMAND_TIMEOUT_S = 1.5 s`).** If the agent hears nothing
+from the laptop for 1.5 s it engages **E-STOP**. The laptop pings every 400 ms,
+about a third of the window, which absorbs ordinary jitter.
+
+E-STOP rather than a plain disable because it **latches**: motors cannot be
+re-energised until the laptop explicitly clears it. After a watchdog trip you
+must click the E-STOP button in the GUI to release it.
+
+**2. Motor-side `canTimeout` (~3 s).** Armed by `ControlWorker` on every enable.
+Covers the *Pi* dying, which the link watchdog cannot.
+
+**3. A physical E-stop wired to motor power.** Not optional. A software E-STOP
+travels over the same link that may be the thing that failed.
+
+Additionally, closing the window or pressing Disconnect calls
+`_disable_everything()`, which sends DISABLE to every registered motor rather
+than only those the GUI believes are enabled — the GUI's belief goes stale.
+
+The agent also exits when its stdin closes, so killing SSH or dropping WiFi tears
+the bus down and disables the motors. That is a deliberate property, not a side
+effect.
+
+### Test the watchdog before trusting it
+
+Start a sweep, then pull WiFi or kill the GUI. The motor must stop within about
+1.5 seconds. Do this once, with nothing attached to the shaft, before you put a
+load on it.
+
+---
+
+## Setup
+
+### On the laptop
+
+```bash
+ssh-keygen -t ed25519                    # if you do not have a key
+ssh-copy-id usvz@rs04pi.local
+ssh usvz@rs04pi.local 'echo ok'          # must print ok with no password
+```
+
+Push the code:
+
+```bash
+rsync -av --exclude '__pycache__' robstride_gui/ \
+  usvz@rs04pi.local:~/Desktop/Robstride_Control_Gui/robstride_gui/
+rsync -av rpi_agent.py usvz@rs04pi.local:~/Desktop/Robstride_Control_Gui/
+```
+
+`publish.py` stays on the laptop. `rpi_agent.py` goes to the Pi.
+
+### On the Pi
+
+```bash
+sudo apt install -y python3-can python3-pyside6.qtcore can-utils
+```
+
+Bring up the CAN interfaces:
+
+```bash
+for i in 0 1 2 3 4; do
+  sudo ip link set can$i down 2>/dev/null
+  sudo ip link set can$i up type can bitrate 1000000
+  sudo ip link set can$i txqueuelen 1000
+done
+ip -details link show can0
+```
+
+Three things matter here:
+
+- **`down` first** — an interface already up refuses a bitrate change with
+  `Device or resource busy`. This makes the loop safe to re-run.
+- **1000000** is the RobStride bitrate. A mismatch gives no clear error:
+  transmits appear to succeed, nothing replies, error counters climb.
+- **`txqueuelen 1000`** — the CAN default is 10 frames, easy to overflow at
+  100 Hz with several motors (`ENOBUFS`). Most guides omit this.
+
+A healthy interface shows `UP` in its flags, `bitrate 1000000`, and
+`state ERROR-ACTIVE`. **`ERROR-ACTIVE` is the good state** despite the name — it
+means the controller is on the bus and participating. Worry about
+`ERROR-PASSIVE` and `BUS-OFF`.
+
+To survive a reboot, wrap those commands in a `oneshot` systemd unit. Use
+`|| true` on each `ip link` call — without it, one missing interface aborts the
+unit and the rest never come up.
+
+### Run
+
+```bash
+python main.py --remote usvz@rs04pi.local \
+    --remote-path '~/Desktop/Robstride_Control_Gui/rpi_agent.py'
+```
+
+The title bar reads `RobStride Control  -  remote: usvz@rs04pi.local`. Running
+`python main.py` with no flags still uses a locally attached adapter.
+
+---
+
+## Bugs found during bring-up
+
+All found on real hardware, all fixed.
+
+**Watchdog tripped at startup.** The agent armed its 1.5 s fuse the moment it
+booted, and the laptop's keepalive slept *before* its first ping. SSH auth plus
+starting Python plus importing Qt exceeded the window, so the rig E-STOPped
+before the GUI had done anything. `_last_command` now starts as `None` and the
+watchdog stays **disarmed until the laptop's first message**; the keepalive pings
+*before* its first sleep. Verified: 3 s of simulated SSH latency no longer trips
+it, 2.5 s of genuine silence still does.
+
+**Motor slammed on enable.** The first CLI publisher commanded `position=0`
+immediately after enabling, so a motor resting at 110 degrees travelled the full
+110 at once. The worker's safe-enable had correctly seeded the hold at 110; the
+publisher then overrode it. Both publishers now wait for real telemetry and start
+from the shaft's actual angle, and `publish.py` **refuses to enable** when no
+telemetry has arrived — which catches a wrong CAN id before energising anything.
+
+**Crash on remote startup.** `RemoteWorker.run()` emitted a log signal before
+`_build_ui()` had created the log view.
+
+**Broken-pipe tracebacks on shutdown.** Worker signals keep firing while the bus
+tears down; each wrote to an already-closed stdout. `Agent.send` now swallows
+`BrokenPipeError` and sets `_stopping`.
+
+**Silent sim-binding drops.** `_sim_joint_map` filtered bindings to connected
+motors and returned the survivors silently. A *partial* match logged nothing, so
+a joint moved in the sim while its motor never twitched, with no message
+anywhere. Every dropped binding is now named alongside the connected ids.
+
+---
+
+## Troubleshooting
+
+**`ERROR: link silent 1.6s - motors stopped` right after connecting.** Fixed by
+the startup-race change; make sure both `rpi_agent.py` and `remote_worker.py` are
+the updated versions on their respective machines.
+
+**`M3: E-STOP engaged - clear it before enabling`.** E-STOP latches. Click the
+E-STOP button in the GUI to release it.
+
+**`could not read position before enable` and `canTimeout write not acked`
+together.** These two in combination mean **no motor is answering at that id**.
+
+**`socketcan send failed: Failed to transmit: Network is down`.** The interface
+exists but is down. python-can binds to a down interface without complaining and
+does not bring it up — only `ip link` does. `SocketCANTransport` now checks
+`IFF_UP` before binding and raises once with the command you need.
+
+**`[timing] Inventory blocked the loop 2710 ms`.** The Scan range is too wide.
+Discovery waits ~20 ms per empty id, so 0-127 costs ~2.5 s. Set the spinboxes
+just above your highest CAN id — 0-5 takes about 0.15 s. Also disable motors
+before pressing Detect: discovery runs on the control thread, and a long enough
+stall exceeds the motors' `canTimeout`.
+
+**Motor registered as the wrong model.** The Model dropdown defaults to `rs-04`.
+Set it *before* pressing Add or Scan. The wrong model means wrong MIT scaling in
+both directions.
+
+**A joint moves in the sim but the motor does not.** Its binding was dropped for
+having no connected motor. The GUI log now names them; check the motor has a tab
+open and that its CAN bus is connected.
+
+**`ModuleNotFoundError` on the Pi.** SSH runs a non-interactive shell that never
+sources your venv, so the agent uses system Python. Either install the deps
+system-wide, or point at the venv interpreter — the path string is passed to the
+shell, so this works:
+
+```
+--remote-path '~/Desktop/venv/bin/python3 -u ~/Desktop/Robstride_Control_Gui/rpi_agent.py'
+```
+
+**`candump` shows nothing on an idle bus.** Expected. RobStride motors do not
+broadcast — they only reply when addressed. Run `candump can4` on the Pi *while*
+the GUI is connected and you will see command/reply pairs.
+
+---
+
+## Known limitations
+
+- **The port dropdown lists the laptop's CAN interfaces, not the Pi's.** With no
+  local CAN hardware it falls back to `can0`-`can4`, which happens to match a
+  RobStride hub — so picking `can4` works by coincidence, not detection.
+- **The Scan range is not remembered**, so it defaults to 0-127 each session.
+- **`publish.py` drives one motor at a time**, by design.
+- **`_comm_failures` is shared across buses**, so a dead adapter can still tear
+  down a healthy one.
+- **A blocking enable stalls every bus.** Command handling runs on the control
+  thread, so an enable or mode-switch starves all buses. `_feed_other_motors`
+  must therefore stay.
+- **Setpoints cross the network at UI rate, not 100 Hz.** Deliberate, but it
+  means fast externally-generated trajectories should be executed on the Pi
+  rather than streamed frame by frame.
