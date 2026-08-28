@@ -6,6 +6,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+*.stl
+*.urdf
+*.xml
+*.json
+*.csv
 
 # experiment datasets (commit deliberately)
 experiments/data/
