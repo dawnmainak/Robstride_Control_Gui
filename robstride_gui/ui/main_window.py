@@ -13,7 +13,8 @@ from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDockWidget, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QDoubleSpinBox, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSpinBox,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -25,7 +26,8 @@ from ..presets import Preset, PresetStore
 from ..protocol import MotorStatus
 from ..transport import (
     SerialATTransport, SocketCANTransport,
-    auto_detect_serial_port, list_serial_port_details,
+    auto_detect_serial_port, can_interface_is_up, list_can_interfaces,
+    list_serial_port_details,
 )
 from .. import worker as wk
 from .dashboard import MotorDashboard
@@ -42,9 +44,13 @@ ERROR_DIALOG_MIN_INTERVAL_S = 3.0
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, remote: "tuple[str, str] | None" = None):
+        """``remote`` is ``(ssh_target, agent_path)`` to drive a Raspberry Pi
+        instead of local hardware, or None for a directly attached adapter."""
         super().__init__()
-        self.setWindowTitle("RobStride Control")
+        self.remote = remote
+        self.setWindowTitle(
+            "RobStride Control" + (f"  -  remote: {remote[0]}" if remote else ""))
         self.resize(1180, 780)
 
         self.panels: dict[int, MotorPanel] = {}
@@ -56,6 +62,9 @@ class MainWindow(QMainWindow):
         # separate .txt data file for offline review.
         self.datalog = TelemetryLogger()
         self._connected = False
+        # Names of the CAN buses currently connected, in the order added. Each
+        # Connect adds one adapter; the list drives the bus picker and label.
+        self._bus_names: list[str] = []
         # Motors whose zero was (re)set since their last enable. The next enable
         # for these asks for confirmation: a fresh zero moves the reference
         # frame, so "hold current position" is safe but the operator should
@@ -75,6 +84,13 @@ class MainWindow(QMainWindow):
         self._refresh_serial_ports()
         self._reload_preset_combo()
 
+        # The remote link starts only once the UI exists. RemoteWorker.run()
+        # emits log/error signals SYNCHRONOUSLY if ssh fails immediately, and
+        # those handlers write to widgets built above - starting it inside
+        # _start_worker would reach a log view that does not exist yet.
+        if self.remote is not None:
+            self.worker.run()
+
         self._plot_timer = QTimer(self)
         self._plot_timer.timeout.connect(self._refresh_plots)
         self._plot_timer.start(PLOT_REFRESH_MS)
@@ -82,10 +98,18 @@ class MainWindow(QMainWindow):
     # -- worker / thread ---------------------------------------------------------
 
     def _start_worker(self) -> None:
-        self.thread = QThread(self)
-        self.worker = wk.ControlWorker()
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        if self.remote is None:
+            self.thread = QThread(self)
+            self.worker = wk.ControlWorker()
+            self.worker.moveToThread(self.thread)
+            self.thread.started.connect(self.worker.run)
+        else:
+            # RemoteWorker exposes the same post()/signals surface, but it owns
+            # a pipe rather than a control loop - its run() returns at once, so
+            # it must NOT be moved to a QThread or driven by started.
+            from ..remote_worker import RemoteWorker
+            self.thread = None
+            self.worker = RemoteWorker(self.remote[0], self.remote[1], parent=self)
 
         self.worker.statusUpdated.connect(self._on_status)
         self.worker.powerUpdated.connect(self._on_power)
@@ -102,7 +126,8 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self._append_log)
         self.worker.error.connect(self._on_error)
 
-        self.thread.start()
+        if self.thread is not None:
+            self.thread.start()
 
     # -- UI construction ---------------------------------------------------------
 
@@ -189,8 +214,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.port_combo)
 
         self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setToolTip("Re-scan for available serial ports")
-        self.refresh_btn.clicked.connect(self._refresh_serial_ports)
+        self.refresh_btn.setToolTip("Re-scan for available ports / CAN interfaces")
+        self.refresh_btn.clicked.connect(self._refresh_ports)
         lay.addWidget(self.refresh_btn)
 
         self.port_status = QLabel()
@@ -198,8 +223,23 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.port_status)
 
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._toggle_connection)
+        self.connect_btn.setToolTip(
+            "Connect the selected adapter. Connecting again with a different "
+            "port ADDS a second CAN bus alongside the first.")
+        self.connect_btn.clicked.connect(self._on_connect_clicked)
         lay.addWidget(self.connect_btn)
+
+        self.disconnect_btn = QPushButton("Disconnect all")
+        self.disconnect_btn.setToolTip("Close every connected CAN bus")
+        self.disconnect_btn.setEnabled(False)
+        self.disconnect_btn.clicked.connect(
+            lambda: self.worker.post(wk.Disconnect()))
+        lay.addWidget(self.disconnect_btn)
+
+        self.bus_label = QLabel("no bus")
+        self.bus_label.setToolTip("CAN buses currently connected")
+        self.bus_label.setStyleSheet("color:#888;")
+        lay.addWidget(self.bus_label)
 
         lay.addSpacing(16)
         lay.addWidget(QLabel("Add motor id"))
@@ -211,6 +251,14 @@ class MainWindow(QMainWindow):
         self.model_combo.addItems(list(proto.MODELS))
         self.model_combo.setCurrentText(proto.DEFAULT_MODEL)
         lay.addWidget(self.model_combo)
+        # Which bus a manually added motor lives on. Scan/Detect fill this in
+        # automatically (the router remembers which adapter answered), so this
+        # only matters for ids typed in by hand.
+        self.bus_combo = QComboBox()
+        self.bus_combo.setToolTip("CAN bus this motor is wired to")
+        self.bus_combo.setMinimumWidth(90)
+        lay.addWidget(self.bus_combo)
+
         self.add_btn = QPushButton("Add")
         self.add_btn.clicked.connect(self._on_add_motor_clicked)
         lay.addWidget(self.add_btn)
@@ -251,6 +299,23 @@ class MainWindow(QMainWindow):
             "Set every motor's zero to its current position")
         self.zero_all_btn.clicked.connect(self._on_zero_all)
         lay.addWidget(self.zero_all_btn)
+
+        # Cruise speed for every position move. In position mode the motor runs
+        # its own trapezoid and this sets the flat part; the model default is
+        # 0.6 x rated, which on an rs-03 is ~286 RPM and makes an entered
+        # position look instant. Shown in RPM to match the rest of the UI.
+        lay.addWidget(QLabel("Speed limit"))
+        self.speed_limit_spin = QDoubleSpinBox()
+        self.speed_limit_spin.setRange(0.0, 400.0)
+        self.speed_limit_spin.setDecimals(0)
+        self.speed_limit_spin.setSuffix(" RPM")
+        self.speed_limit_spin.setValue(0.0)          # 0 = model default
+        self.speed_limit_spin.setSpecialValueText("model default")
+        self.speed_limit_spin.setToolTip(
+            "Maximum cruise speed for position moves. 0 uses the model's own "
+            "limit. Applies to every motor and survives reconnecting.")
+        self.speed_limit_spin.valueChanged.connect(self._on_speed_limit_changed)
+        lay.addWidget(self.speed_limit_spin)
 
         self.estop_btn = QPushButton("E-STOP")
         self.estop_btn.setCheckable(True)
@@ -384,9 +449,34 @@ class MainWindow(QMainWindow):
         if self._is_serial():
             self._refresh_serial_ports()
         else:
-            self.port_combo.addItems(["can0", "can1"])
-            self.port_status.setText("")
-            self._set_connect_enabled(True)
+            self._refresh_can_channels()
+
+    def _refresh_can_channels(self) -> None:
+        """Populate the port dropdown with every CAN interface on this machine.
+
+        Enumerated from sysfs instead of a fixed two-entry list, so all of a
+        multi-bus adapter's ports appear - a RobStride CAN hub exposes can0..can4
+        and the old hardcoded ["can0", "can1"] hid three of them. Interfaces that
+        are DOWN are still listed but flagged, since the fix is one ip link
+        command away and hiding them would just look like missing hardware.
+        """
+        self.port_combo.clear()
+        channels = list_can_interfaces()
+        up_count = 0
+        for channel in channels:
+            is_up = can_interface_is_up(channel)
+            up_count += is_up
+            label = channel if is_up else f"{channel} (down)"
+            self.port_combo.addItem(label, channel)
+        self._set_port_status(available=up_count > 0, count=up_count)
+        self._set_connect_enabled(bool(channels))
+
+    def _refresh_ports(self) -> None:
+        """Re-enumerate ports for whichever transport is selected."""
+        if self._is_serial():
+            self._refresh_serial_ports()
+        else:
+            self._refresh_can_channels()
 
     def _refresh_serial_ports(self) -> None:
         if not self._is_serial():
@@ -437,24 +527,73 @@ class MainWindow(QMainWindow):
             return SerialATTransport(target)
         return SocketCANTransport(target or "can0")
 
-    def _toggle_connection(self) -> None:
-        if self._connected:
-            self.worker.post(wk.Disconnect())
-            return
-        if not self.panels:
-            self._add_motor(self.add_id_spin.value(), self.model_combo.currentText())
-        motors = [Motor(device_id=did, model=p.model) for did, p in self.panels.items()]
+    def _derive_bus_name(self, target: str) -> str:
+        """A short, unique name for the bus this adapter will become.
+
+        Taken from the device path so it is recognisable in logs and the bus
+        picker: "/dev/ttyUSB0" -> "ttyUSB0", "can0" -> "can0". Suffixed if that
+        name is already taken, since a bus name is the router's key and a
+        duplicate would silently REPLACE the earlier adapter.
+        """
+        base = (target.rsplit("/", 1)[-1] or "bus").strip()
+        name, n = base, 2
+        while name in self._bus_names:
+            name, n = f"{base}#{n}", n + 1
+        return name
+
+    def _on_connect_clicked(self) -> None:
+        """Connect the selected adapter, ADDING it to any already connected.
+
+        Connect is additive rather than a toggle: pick the first adapter and
+        press Connect, then pick the second and press Connect again, and both
+        buses run at once. "Disconnect all" closes them.
+        """
         try:
             transport = self._build_transport()
         except Exception as e:
             self._on_error(str(e))
             return
-        self.worker.post(wk.Connect(transport=transport, motors=motors))
+        bus_name = self._derive_bus_name(self._current_port())
+        # Only the FIRST bus adopts the motors already tabbed, which preserves
+        # the old single-adapter flow (add a motor, then Connect). Later buses
+        # start empty: those existing panels belong to an earlier adapter, and
+        # handing them over would reroute motors that are already wired up.
+        if not self._bus_names:
+            if not self.panels:
+                self._add_motor(self.add_id_spin.value(),
+                                self.model_combo.currentText(), bus_name)
+            motors = [Motor(device_id=did, model=p.model)
+                      for did, p in self.panels.items()]
+        else:
+            motors = []
+        self._bus_names.append(bus_name)
+        self._refresh_bus_widgets()
+        self.worker.post(wk.Connect(transport=transport, motors=motors,
+                                    bus_name=bus_name))
+        self._append_log(f"Connecting bus '{bus_name}' via {transport.name}")
+
+    def _refresh_bus_widgets(self) -> None:
+        """Keep the bus label and the per-motor bus picker in step with
+        ``_bus_names``, preserving the current pick where possible."""
+        self.bus_label.setText(", ".join(self._bus_names) or "no bus")
+        previous = self.bus_combo.currentText()
+        self.bus_combo.clear()
+        self.bus_combo.addItems(self._bus_names)
+        index = self.bus_combo.findText(previous)
+        self.bus_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.disconnect_btn.setEnabled(bool(self._bus_names))
+
+    def _selected_bus(self) -> str | None:
+        """Bus chosen for a hand-added motor, or None while only one exists."""
+        return self.bus_combo.currentText() or None if len(self._bus_names) > 1 else None
 
     # -- motors ------------------------------------------------------------------
 
     def _on_add_motor_clicked(self) -> None:
-        self._add_motor(self.add_id_spin.value(), self.model_combo.currentText())
+        # A hand-typed id has never been seen on the wire, so the router cannot
+        # know its bus - take it from the picker.
+        self._add_motor(self.add_id_spin.value(), self.model_combo.currentText(),
+                        self._selected_bus())
 
     def _on_scan_clicked(self) -> None:
         start = self.scan_start_spin.value()
@@ -540,7 +679,8 @@ class MainWindow(QMainWindow):
         panel.deleteLater()
         self._refresh_sim_map()
 
-    def _add_motor(self, device_id: int, model: str) -> MotorPanel:
+    def _add_motor(self, device_id: int, model: str,
+                   bus_name: str | None = None) -> MotorPanel:
         if device_id in self.panels:
             self.tabs.setCurrentWidget(self.panels[device_id])
             return self.panels[device_id]
@@ -580,7 +720,8 @@ class MainWindow(QMainWindow):
         # else it gets a tab but is never polled/driven (Connect only seeds the
         # motors open at connect time).
         if self._connected:
-            self.worker.post(wk.AddMotor(device_id=device_id, model=model))
+            self.worker.post(wk.AddMotor(device_id=device_id, model=model,
+                                         bus_name=bus_name))
         # Pick this motor up in the sim bridge's joint map if it is streaming, so
         # a motor connected after the bridge started needs no off/on toggle.
         self._refresh_sim_map()
@@ -662,19 +803,32 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_connection_changed(self, connected: bool) -> None:
         self._connected = connected
-        self.connect_btn.setText("Disconnect" if connected else "Connect")
+        # The adapter selectors stay live while connected: that is how a SECOND
+        # bus gets added. Connect is additive now, so the button keeps its label
+        # instead of flipping to "Disconnect" (that is its own button).
         self.connect_btn.setEnabled(True)
-        self.transport_combo.setEnabled(not connected)
-        self.port_combo.setEnabled(not connected)
-        self.refresh_btn.setEnabled(not connected)
+        self.transport_combo.setEnabled(True)
+        self.port_combo.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
         if not connected:
-            # Re-check availability now that the port is free again.
+            # Teardown closes every bus at once, so drop them all.
+            self._bus_names.clear()
+            self._refresh_bus_widgets()
+            # Re-check availability now that the ports are free again.
             self._refresh_serial_ports()
 
     @Slot(list)
     def _on_scan_finished(self, ids: list) -> None:
+        # Use the model picked in the Model combo, NOT DEFAULT_MODEL. Hardcoding
+        # the default silently registered every scanned motor as an rs-04, so an
+        # rs-03 (or any non-default model) got rs-04 MIT scaling: its velocity,
+        # torque and kp/kd codes were computed against the wrong full-scale
+        # values, and the decoded feedback was wrong by the same factor. The
+        # motor answers the ping, the tab appears, and then nothing behaves.
+        # This mirrors what _on_inventory_ready (the Detect button) already did.
+        model = self.model_combo.currentText()
         for device_id in ids:
-            self._add_motor(int(device_id), proto.DEFAULT_MODEL)
+            self._add_motor(int(device_id), model)
 
     @Slot(list)
     def _on_bus_collision(self, ids: list) -> None:
@@ -808,6 +962,11 @@ class MainWindow(QMainWindow):
             for device_id in self.dashboard.rows:
                 self.dashboard.set_enabled_state(device_id, False)
 
+    def _on_speed_limit_changed(self, rpm: float) -> None:
+        """Push the speed cap to the worker. 0 means the model default."""
+        value = None if rpm <= 0 else float(rpm) * proto.RPM_TO_RAD_S
+        self.worker.post(wk.SetVelocityLimit(value=value))
+
     def _on_disable_all(self) -> None:
         """De-energise every motor and reflect the disabled state in the UI."""
         ids = list(self.panels)
@@ -911,8 +1070,9 @@ class MainWindow(QMainWindow):
         try:
             self.sim_dock.shutdown()
             self.worker.stop()
-            self.thread.quit()
-            self.thread.wait(2000)
+            if self.thread is not None:
+                self.thread.quit()
+                self.thread.wait(2000)
             self.datalog.close()
         finally:
             super().closeEvent(event)
